@@ -34,8 +34,7 @@ Description=Proxy Python Service
 After=network.target
 
 [Service]
-User=$USER
-Group=$USER
+User=root
 WorkingDirectory=$WORK_DIR
 Environment="PATH=$VENV_DIR/bin"
 ExecStart=$PYTHON_EXEC $SCRIPT
