@@ -272,5 +272,5 @@ if __name__ == "__main__":
     start_server(
         username=environ.get("username", "user"), 
         password=environ.get("password", "passw"),
-        port=environ.get("port", 8080)
+        port=int(environ.get("port", 8080))
     )
