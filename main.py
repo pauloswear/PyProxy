@@ -14,6 +14,11 @@ MAX_THREADS = 300
 BLACKLISTED = []
 MAX_CHUNK_SIZE = 16 * 1024
 
+# Rate limiting settings for login attempts
+LOGIN_RATE_LIMIT = 5  # Number of login attempts allowed per period
+LOGIN_RATE_PERIOD = 60*10  # Time period
+login_attempts = {}
+
 class StaticResponse:
     connection_established = b"HTTP/1.1 200 Connection Established\r\n\r\n"
     block_response = b'HTTP/1.1 200 OK\r\nPragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\nDate: Sat, 15 Feb 2020 07:04:42 GMT\r\nConnection: close\r\n\r\n<html><head><title>ISP ERROR</title></head><body><p style="text-align: center;">&nbsp;</p><p style="text-align: center;">&nbsp;</p><p style="text-align: center;">&nbsp;</p><p style="text-align: center;">&nbsp;</p><p style="text-align: center;">&nbsp;</p><p style="text-align: center;">&nbsp;</p><p style="text-align: center;"><span><strong>**YOU ARE NOT AUTHORIZED TO ACCESS THIS WEB PAGE | YOUR PROXY SERVER HAS BLOCKED THIS DOMAIN**</strong></span></p><p style="text-align: center;"><span><strong>**CONTACT YOUR PROXY ADMINISTRATOR**</strong></span></p></body></html>'
@@ -21,6 +26,7 @@ class StaticResponse:
 class Error:
     STATUS_503 = "Service Unavailable"
     STATUS_505 = "HTTP Version Not Supported"
+    STATUS_429 = "Too Many Requests"
 
 for key in filter(lambda x: x.startswith("STATUS"), dir(Error)):
     _, code = key.split("_")
@@ -140,7 +146,31 @@ class ConnectionHandle(threading.Thread):
             if not line.startswith(b"Proxy-Connection:") and not line.startswith(b"Proxy-Authorization:"):
                 updated_lines.append(line)
         return b"\r\n".join(updated_lines)
+    
+    def check_login_rate_limit(self):
+        """
+        Check if the client IP has exceeded the login rate limit.
+        """
+        client_ip = self.client_addr[0]
+        current_time = time.time()
 
+        if client_ip in login_attempts:
+            attempts, first_attempt_time = login_attempts[client_ip]
+            if current_time - first_attempt_time > LOGIN_RATE_PERIOD:
+                # Reset login rate limit after the period has passed
+                login_attempts[client_ip] = (1, current_time)
+                return True
+            elif attempts < LOGIN_RATE_LIMIT:
+                # Increment the login attempt count within the current period
+                login_attempts[client_ip] = (attempts + 1, first_attempt_time)
+                return True
+            else:
+                # Login rate limit exceeded
+                return False
+        else:
+            # New client IP, initialize login rate limiting
+            login_attempts[client_ip] = (1, current_time)
+            return True
 
     def run(self):
         rawreq = self.client_conn.recv(MAX_CHUNK_SIZE)
@@ -160,106 +190,84 @@ class ConnectionHandle(threading.Thread):
             logg.info(f"{req.method:<8} {req.path} {req.protocol} BLOCKED")
             return
 
+        if not self.check_login_rate_limit():
+            self.client_conn.send(Error.STATUS_429)
+            self.client_conn.close()
+            logg.info(f"Login rate limit exceeded for {self.client_addr[0]}")
+            return
+
         if not self.authenticate(req):
             response = b"HTTP/1.1 407 Proxy Authentication Required\r\n"
             response += b"Proxy-Authenticate: Basic realm=\"Proxy Authentication Required\"\r\n"
             response += b"\r\n"
             self.client_conn.send(response)
-            self.client_conn.close()  # Close the connection after sending 407 Proxy Authentication Required
+            self.client_conn.close()
             return
-
 
         self.server_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         try:
             self.server_conn.connect((req.host, req.port))
-        except:
+        except Exception as e:
             self.client_conn.send(Error.STATUS_503)
             self.client_conn.close()
             return
 
-        if req.method == Method.connect:
-            self.client_conn.send(StaticResponse.connection_established)
-        else:
-            rawreq = self.remove_proxy_headers(rawreq)
-            self.server_conn.send(rawreq)
+        self.client_conn.send(StaticResponse.connection_established)
+        self.server_conn.send(self.remove_proxy_headers(req.raw))
+
+        self.server_conn.setblocking(0)
+        self.client_conn.setblocking(0)
 
         res = None
 
         while True:
-            triple = select.select([self.client_conn, self.server_conn], [], [], 60)[0]
-            if not len(triple):
-                break
             try:
-                if self.client_conn in triple:
+                ready = select.select([self.client_conn, self.server_conn], [], [])[0]
+                if self.client_conn in ready:
                     data = self.client_conn.recv(MAX_CHUNK_SIZE)
                     if not data:
                         break
                     self.server_conn.send(data)
-                if self.server_conn in triple:
+                if self.server_conn in ready:
                     data = self.server_conn.recv(MAX_CHUNK_SIZE)
-                    if not res:
-                        res = Response(data)
-                        logg.info(f"{req.method:<8} {req.path} {req.protocol} {res.status if res else ''}")
+                    res = Response(data)
                     if not data:
                         break
                     self.client_conn.send(data)
-            except ConnectionAbortedError:
+            except Exception as e:
                 break
 
+        if res:
+            logg.info(f"{req.method:<8} {req.path} {req.protocol} {res.status} {res.status_str} {self.client_addr[0]}")
 
-    def __del__(self):
-        if hasattr(self, "server_conn"):
-            self.server_conn.close()
         self.client_conn.close()
+        self.server_conn.close()
 
+def start_server(addr="0.0.0.0", port=8080, username=None, password=None):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((addr, port))
+    server.listen(BACKLOG)
+    logg.info(f"Serving on {addr}:{port}")
 
-class Server:
-    def __init__(self, host:str, port:int, username=None, password=None):
-        self.username = username
-        self.password = password
-        self.host = host
-        self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind((host, port))
-        self.sock.listen(BACKLOG)
+    while True:
+        if threading.active_count() < MAX_THREADS:
+            try:
+                conn, addr = server.accept()
+                logg.info(f"New connection from {addr}")
+                handler = ConnectionHandle(conn, addr, username, password)
+                handler.start()
+            except KeyboardInterrupt:
+                server.close()
+                break
+            except Exception as e:
+                logg.error(f"Error accepting connections: {e}")
+                continue
 
-
-    def thread_check(self):
-        while True:
-            if threading.active_count() >= MAX_THREADS:
-                time.sleep(1)
-            else:
-                return
-
-    def start(self):
-        while True:
-            conn, client_addr = self.sock.accept()
-            self.thread_check()
-            s = ConnectionHandle(conn, client_addr, self.username, self.password)
-            s.start()
-
-    def __del__(self):
-        self.sock.close()
-
-
-if __name__ == '__main__':
-    ser = Server(
-        host="0.0.0.0", 
-        port=8081, 
-        username=None,
-        password=None
+if __name__ == "__main__":
+    start_server(
+        username="user", 
+        password="pass",
+        port=80
     )
-
-    logg.info(f"Proxy server starting")
-    addr_machine = socket.gethostbyname(socket.gethostname())
-    host = ser.host.replace("0.0.0.0", addr_machine)
-
-    if ser.username and ser.password:
-        logg.info(f"Listening at: http://{ser.username}:{ser.password}@{host}:{ser.port}")
-
-    else:
-        logg.info(f"Listening at: http://{host}:{ser.port}")
-
-
-    ser.start()
