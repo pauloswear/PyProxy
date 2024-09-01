@@ -5,7 +5,10 @@ import time
 import re
 import logging
 import base64
+from dotenv import load_dotenv
+from os import environ
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(process)s] [%(levelname)s] %(message)s")
 logg = logging.getLogger(__name__)
 
@@ -267,7 +270,7 @@ def start_server(addr="0.0.0.0", port=8080, username=None, password=None):
 
 if __name__ == "__main__":
     start_server(
-        username="user", 
-        password="pass",
-        port=80
+        username=environ.get("username", "user"), 
+        password=environ.get("password", "passw"),
+        port=environ.get("port", 8080)
     )
